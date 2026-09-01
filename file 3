@@ -1,0 +1,156 @@
+import streamlit as st
+import cv2
+import numpy as np
+import pandas as pd
+import pytesseract
+from skimage.metrics import structural_similarity as ssim
+from datetime import datetime
+import io
+
+# Setup webpage config
+st.set_page_config(page_title="Packaging Label Inspector", layout="wide")
+st.title("🏭 Packaging Label QA Inspector (A-Z Mobile Edition)")
+st.write("Aligns smartphone photos, runs OCR text checks, flags graphic errors, and logs history.")
+
+# Initialize persistent session state for the shift log history
+if "history_log" not in st.session_state:
+    st.session_state.history_log = []
+
+# Sidebar configuration inputs
+st.sidebar.header("📋 Inspection Parameters")
+operator_id = st.sidebar.text_input("Operator ID / Station Number", "Line_A_Op1")
+sku_name = st.sidebar.text_input("Product SKU / Label ID", "SKU-9942")
+expected_text = st.sidebar.text_area("Expected OCR Text (e.g., Batch/Expiry formats)", "EXP: 12/2028")
+ssim_threshold = st.sidebar.slider("Graphic Passing Threshold (SSIM %)", 70, 100, 85) / 100.0
+
+# Image upload UI columns
+col1, col2 = st.columns(2)
+with col1:
+    ref_file = st.file_uploader("1. Upload Digital Reference Layout (Perfect Master)", type=["png", "jpg", "jpeg"])
+with col2:
+    prod_file = st.file_uploader("2. Upload Smartphone Photo from Factory Floor", type=["png", "jpg", "jpeg"])
+
+# Helper function to align smartphone image to the reference image
+def align_images(reference, camera_photo):
+    # Convert to grayscale
+    ref_gray = cv2.cvtColor(reference, cv2.COLOR_BGR2GRAY)
+    photo_gray = cv2.cvtColor(camera_photo, cv2.COLOR_BGR2GRAY)
+    
+    # Initialize ORB detector
+    orb = cv2.ORB_create(nfeatures=2000)
+    kp1, des1 = orb.detectAndCompute(ref_gray, None)
+    kp2, des2 = orb.detectAndCompute(photo_gray, None)
+    
+    if des1 is None or des2 is None:
+        return None
+        
+    # Match features using Brute-Force Matcher
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des1, des2)
+    matches = sorted(matches, key=lambda x: x.distance)
+    
+    # Take top matches to calculate transformation matrix
+    good_matches = matches[:50]
+    if len(good_matches) < 10:
+        return None
+        
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+    
+    # Find homography alignment matrix
+    M, mask = cv2.findHomography(dst_pts, src_pts, cv2.RANSAC, 5.0)
+    
+    # Warp perspective to stretch/rotate smartphone photo to perfectly match reference size
+    h, w, c = reference.shape
+    aligned_photo = cv2.warpPerspective(camera_photo, M, (w, h))
+    return aligned_photo
+
+# Processing Engine
+if ref_file and prod_file:
+    # Read files into OpenCV format
+    ref_bytes = np.frombuffer(ref_file.read(), np.uint8)
+    prod_bytes = np.frombuffer(prod_file.read(), np.uint8)
+    
+    img_ref = cv2.imdecode(ref_bytes, cv2.IMREAD_COLOR)
+    img_prod = cv2.imdecode(prod_bytes, cv2.IMREAD_COLOR)
+    
+    st.info("🔄 Processing images: Aligning perspective angles...")
+    img_aligned = align_images(img_ref, img_prod)
+    
+    if img_aligned is None:
+        st.error("❌ Alignment failed! Ensure your smartphone photo is clear, well-lit, and shows the entire label face.")
+    else:
+        # Convert to grayscale for calculations
+        gray_ref = cv2.cvtColor(img_ref, cv2.COLOR_BGR2GRAY)
+        gray_aligned = cv2.cvtColor(img_aligned, cv2.COLOR_BGR2GRAY)
+        
+        # 1. GRAPHIC COMPARISON ENGINE (SSIM)
+        score, diff = ssim(gray_ref, gray_aligned, full=True)
+        diff = (diff * 255).astype("uint8")
+        
+        # Threshold the difference image to generate bright red defect highlights
+        thresh = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
+        defect_overlay = img_aligned.copy()
+        defect_overlay[thresh == 255] = [255, 0, 0] # Color defects bright red
+        
+        # 2. TEXT ENGINE (OCR)
+        # Use Tesseract to pull text strings from the aligned image
+        ocr_text = pytesseract.image_to_string(gray_aligned)
+        
+        # Simple evaluation logic
+        text_passed = expected_text.lower().strip() in ocr_text.lower().strip() if expected_text else True
+        graphic_passed = score >= ssim_threshold
+        final_verdict = "PASS" if (text_passed and graphic_passed) else "FAIL"
+        
+        # Save to permanent history session array
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        st.session_state.history_log.append({
+            "Timestamp": now,
+            "Operator ID": operator_id,
+            "SKU": sku_name,
+            "Graphic Match %": f"{score*100:.1f}%",
+            "OCR Found Text": ocr_text.replace('\n', ' ').strip()[:50],
+            "Verdict": final_verdict
+        })
+        
+        # Display Results Dashboard
+        st.header("📊 Live Inspection Results")
+        
+        c_v1, c_v2, c_v3 = st.columns(3)
+        c_v1.metric("Graphic Similarity Score", f"{score*100:.1f}%", delta=f"{'Target Met' if graphic_passed else 'Low Quality'}")
+        c_v2.metric("Text Match Status", "PASSED" if text_passed else "FAILED")
+        
+        if final_verdict == "PASS":
+            c_v3.success("🟢 VERDICT: LABEL ACCEPTED")
+        else:
+            c_v3.error("🔴 VERDICT: LABEL REJECTED")
+            
+        # Display Side-by-Side Diagnostic Images
+        st.subheader("🔍 Visual Defect Maps")
+        disp_col1, disp_col2, disp_col3 = st.columns(3)
+        with disp_col1:
+            st.image(cv2.cvtColor(img_ref, cv2.COLOR_BGR2RGB), caption="Digital Master Reference")
+        with disp_col2:
+            st.image(cv2.cvtColor(img_aligned, cv2.COLOR_BGR2RGB), caption="Aligned Smartphone Photo")
+        with disp_col3:
+            st.image(cv2.cvtColor(defect_overlay, cv2.COLOR_BGR2RGB), caption="Red Highlighted Deviations")
+            
+        st.subheader("📝 Extracted OCR Text Data")
+        st.code(ocr_text if ocr_text.strip() else "[No text detected on the label]")
+
+# Display and Export Shift Log Database
+st.header("📜 Shift Inspection Log")
+if st.session_state.history_log:
+    df_log = pd.DataFrame(st.session_state.history_log)
+    st.dataframe(df_log, use_container_width=True)
+    
+    # Convert data frame to downloadable CSV
+    csv_data = df_log.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="📥 Export Shift Log History to CSV",
+        data=csv_data,
+        file_name=f"label_inspection_log_{datetime.now().strftime('%Y%m%d')}.csv",
+        mime="text/csv"
+    )
+else:
+    st.info("No inspections logged yet during this active session.")
